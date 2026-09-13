@@ -11,6 +11,24 @@ import {
   Utensils, QrCode, Ban, ShieldAlert
 } from "lucide-react";
 
+/* ================= AUDIO FEEDBACK ================= */
+const playBeep = () => {
+  try {
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.type = "sine";
+    osc.frequency.setValueAtTime(1200, ctx.currentTime); // High pitch scanner beep
+    gain.gain.setValueAtTime(0.1, ctx.currentTime); // Volume control
+    osc.start();
+    osc.stop(ctx.currentTime + 0.1); // Short 100ms duration
+  } catch (e) {
+    console.error("Audio playback failed", e);
+  }
+};
+
 /* ================= TOAST COMPONENT ================= */
 function Toast({ msg, type }) {
   const colors = {
@@ -139,7 +157,7 @@ export default function Dashboard() {
     const savedState = localStorage.getItem("terminalLocked");
     return savedState === "true"; 
   });
-  const [adminStatus, setAdminStatus] = useState("Active"); // "Active", "Blocked", "Locked"
+  const [adminStatus, setAdminStatus] = useState("Active"); 
   
   const [pin, setPin] = useState("");
   const [isPinError, setIsPinError] = useState(false);
@@ -162,9 +180,18 @@ export default function Dashboard() {
   const [scannedOrderPreview, setScannedOrderPreview] = useState(null);
   const [isDelivering, setIsDelivering] = useState(false);
   const [showSuccessAnim, setShowSuccessAnim] = useState(false);
+  
   const scannerRef = useRef(null);
+  const broadcastChannelRef = useRef(null);
 
-  const showOrderModal = !!scannedOrderPreview; 
+  // ✅ FIX: Restored the showOrderModal boolean
+  const showOrderModal = !!scannedOrderPreview;
+
+  // Initialize Broadcast Channel for cross-tab communication to Navbar
+  useEffect(() => {
+    broadcastChannelRef.current = new BroadcastChannel('canteen-events');
+    return () => broadcastChannelRef.current?.close();
+  }, []);
 
   useEffect(() => {
     const handleResize = () => setIsMobile(window.innerWidth < 1024);
@@ -185,7 +212,6 @@ export default function Dashboard() {
   // --- 1. LIVE DATA & ADMIN STATUS POLLING ---
   const fetchTerminalData = async () => {
     try {
-      // 1. Fetch Orders
       const orderRes = await apiCall("/admin/orders", { method: "GET" });
       const deliveredOrders = orderRes.data.filter(o => o.status?.toLowerCase() === 'delivered');
       const activeOrders = orderRes.data.filter(o => o.status?.toLowerCase() !== 'delivered' && o.status?.toLowerCase() !== 'cancelled');
@@ -193,14 +219,11 @@ export default function Dashboard() {
       setQueue(deliveredOrders.slice(0, 50));
       setStats({ pending: activeOrders.length, servedToday: deliveredOrders.length });
 
-      // 2. Fetch Terminal Status (Check if Admin blocked/locked this counter)
-      // NOTE: Ensure your backend has a route like `/counter/status` returning { status: "Blocked" | "Locked" | "Active" }
       const statusRes = await apiCall("/counter/status", { method: "GET" }).catch(() => null);
       if (statusRes && statusRes.data) {
         const currentStatus = statusRes.data.status;
         setAdminStatus(currentStatus);
         
-        // If admin forces a lock, trigger the local lock screen instantly
         if (currentStatus === "Locked" && !isLocked) {
           setIsLocked(true);
         }
@@ -212,7 +235,7 @@ export default function Dashboard() {
 
   useEffect(() => {
     fetchTerminalData();
-    const t = setInterval(fetchTerminalData, 5000); // Polling every 5s for rapid Admin response
+    const t = setInterval(fetchTerminalData, 5000);
     return () => clearInterval(t);
   }, [isLocked]);
 
@@ -256,7 +279,6 @@ export default function Dashboard() {
   };
 
   useEffect(() => {
-    // Prevent manual unlock if the Admin strictly blocked the terminal
     if (!isLocked || adminStatus === "Blocked") return;
     
     const handleKeyDown = (e) => {
@@ -280,8 +302,6 @@ export default function Dashboard() {
   }, [isLocked, isPinError, adminStatus]);
 
   useEffect(() => {
-    // If admin has forced a lock, prevent the UI from unlocking even if PIN is right
-    // (Assuming the admin must unlock it from the dashboard. Alternatively, you can allow PIN unlock).
     if (isLocked && pin.length === 6) {
       if (pin === "123456" && adminStatus !== "Blocked") { 
         setTimeout(() => {
@@ -304,6 +324,7 @@ export default function Dashboard() {
     let cleanId = String(rawString).trim().toUpperCase();
     if (!cleanId) return;
 
+    playBeep(); // Trigger hardware beep sound
     setIsProcessing(true);
     
     try {
@@ -315,6 +336,13 @@ export default function Dashboard() {
         } else {
           showToastMsg("Order Found! Ready to dispense.", "success");
           setScannedOrderPreview(res.data);
+          
+          // Broadcast to customer's Navbar that order is preparing/scanned
+          broadcastChannelRef.current?.postMessage({
+            type: 'ORDER_SCANNED',
+            orderId: cleanId,
+            items: res.data.items || []
+          });
         }
       }
     } catch (err) {
@@ -345,8 +373,13 @@ export default function Dashboard() {
       setScannedOrderPreview(null);
       showToastMsg("Order served successfully", "success");
       setShowSuccessAnim(true); 
-      
       fetchTerminalData(); 
+      
+      // Broadcast to customer's Navbar that order is delivered
+      broadcastChannelRef.current?.postMessage({
+        type: 'ORDER_DELIVERED',
+        orderId: orderId
+      });
       
       if (scannerRef.current && mode === "camera") {
         setTimeout(() => scannerRef.current.resume(), 1000);
@@ -366,12 +399,41 @@ export default function Dashboard() {
     setHardwareReady(false);
   };
 
-  /* --- 6. HARDWARE SCANNER ENGINE (USB) --- */
+  /* --- 6. HARDWARE SCANNER ENGINE (WebHID + Keyboard Fallback) --- */
+  useEffect(() => {
+    if (!('hid' in navigator)) return;
+
+    const handleConnect = (e) => {
+      const deviceName = e.device.productName || "USB Scanner";
+      showToastMsg(`Scanner Detected: ${deviceName}`, "info");
+      setHardwareReady(true);
+    };
+
+    const handleDisconnect = (e) => {
+      showToastMsg("Scanner Disconnected", "warn");
+      setHardwareReady(false);
+    };
+
+    navigator.hid.addEventListener('connect', handleConnect);
+    navigator.hid.addEventListener('disconnect', handleDisconnect);
+
+    // Auto-detect previously permitted devices
+    navigator.hid.getDevices().then(devices => {
+      if (devices.length > 0) setHardwareReady(true);
+    });
+
+    return () => {
+      navigator.hid.removeEventListener('connect', handleConnect);
+      navigator.hid.removeEventListener('disconnect', handleDisconnect);
+    };
+  }, []);
+
   useEffect(() => {
     let buffer = "";
     let lastKeyTime = Date.now();
 
     const handleHardwareKeyDown = (e) => {
+      // ✅ Now showOrderModal exists and prevents keyboard events while modal is open
       if (mode !== "hardware" || setupPhase || !hardwareReady || isLocked || showOrderModal || adminStatus === "Blocked") return;
       if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
 
@@ -394,13 +456,27 @@ export default function Dashboard() {
     return () => window.removeEventListener('keydown', handleHardwareKeyDown, true);
   }, [mode, setupPhase, hardwareReady, isLocked, showOrderModal, adminStatus]);
 
-  const initHardwareScanner = () => {
+  const initHardwareScanner = async () => {
     setSetupPhase(false);
-    showToastMsg("Detecting USB Scanner...", "info");
+    if ('hid' in navigator) {
+      try {
+        const devices = await navigator.hid.requestDevice({ filters: [] });
+        if (devices.length > 0) {
+          const deviceName = devices[0].productName || "Hardware Scanner";
+          showToastMsg(`Scanner Detected: ${deviceName}`, "success");
+          setHardwareReady(true);
+          return;
+        }
+      } catch (err) {
+        console.log("HID request cancelled or failed, falling back to keyboard wedge mode.");
+      }
+    }
+    
+    // Fallback to purely keyboard wedge mode
+    showToastMsg("Keyboard Scanner Mode Active", "info");
     setTimeout(() => {
       setHardwareReady(true);
-      showToastMsg("Scanner Connected & Ready", "success");
-    }, 1500);
+    }, 1000);
   };
 
   /* --- 7. CAMERA SETUP (OPTIMIZED FOR QR CODES) --- */
@@ -477,7 +553,7 @@ export default function Dashboard() {
         />
       )}
 
-      {/* ================= ADMIN BLOCKED OVERLAY (Highest Priority) ================= */}
+      {/* ================= ADMIN BLOCKED OVERLAY ================= */}
       {adminStatus === "Blocked" && (
         <div className="fixed inset-0 z-[9999] flex flex-col items-center justify-center bg-red-950/95 backdrop-blur-3xl animate-in fade-in duration-500">
           <div className="bg-white rounded-[2rem] p-10 max-w-md text-center shadow-2xl flex flex-col items-center animate-in zoom-in-95 duration-500">
